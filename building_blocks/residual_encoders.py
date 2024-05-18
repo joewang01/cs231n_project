@@ -141,13 +141,13 @@ class SelfAttentionTransformer(nn.Module):
         pos_embedding = torch.zeros(seq_length, d_model)
         pos_embedding[:, 0::2] = torch.sin(position * div_term)
         pos_embedding[:, 1::2] = torch.cos(position * div_term)
-        return pos_embedding
+        return pos_embedding.unsqueeze(1)
 
     def forward(self, src, mask=None):
         src_shape = src.shape
         #src = src.permute(1, 0, 2)
 
-        pos_embed = self.position_embedding.repeat(src_shape[0], 1, 1)
+        pos_embed = self.position_embedding
 
         if mask is not None:
             mask = mask.flatten(1)
@@ -209,8 +209,8 @@ class TransformerEncoderLayer(nn.Module):
         self.normalize_before = normalize_before
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
-        nb, seq_length, d_model = tensor.shape
-        pos = pos[:,:seq_length, :]
+        seq_length, _, _ = tensor.shape
+        pos = pos[:seq_length,:, :]
         return tensor + pos
 
 
@@ -221,9 +221,9 @@ class TransformerEncoderLayer(nn.Module):
         src_key_padding_mask: Optional[Tensor] = None,
         pos: Optional[Tensor] = None,
     ):
-        q = k = self.with_pos_embed(src, pos)
+        x_pos = self.with_pos_embed(src, pos)
         src2, attn_weights = self.self_attn(
-            q, k, value=src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask
+            x_pos, x_pos, value=x_pos, attn_mask=src_mask, key_padding_mask=src_key_padding_mask
         )
         src = src + self.dropout1(src2)
         src = self.norm1(src)
@@ -405,7 +405,7 @@ class ResidualEncoder(nn.Module):
 
         batch_size = x.size(0)
         x_shape = x.shape
-        x = x.view(batch_size, -1, self.output_channels[-1])  # Flatten spatial dimensions
+        x = x.view(batch_size,self.output_channels[-1],-1).permute(2,0,1)  # Flatten spatial dimensions
         
         x = self.linear_to_transformer(x)  # Apply linear layer to get desired transformer dimension
         
@@ -415,7 +415,7 @@ class ResidualEncoder(nn.Module):
 
         # Reshape back to original conv output shape
         spatial_dims = x_shape[2:]
-        x = x.permute(0,2,1).view(batch_size, self.output_channels[-1], *spatial_dims)
+        x = x.permute(1,2,0).view(batch_size, self.output_channels[-1], *spatial_dims)
         
         
         ret[-1] = x
