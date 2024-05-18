@@ -147,7 +147,7 @@ class SelfAttentionTransformer(nn.Module):
         src_shape = src.shape
         #src = src.permute(1, 0, 2)
 
-        pos_embed = self.position_embedding
+        pos_embed = self.position_embedding.to(src.device)
 
         if mask is not None:
             mask = mask.flatten(1)
