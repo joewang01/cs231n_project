@@ -97,6 +97,8 @@ from torch.nn.modules.dropout import _DropoutNd
 from dynamic_network_architectures.building_blocks.residual import StackedResidualBlocks, BottleneckD, BasicBlockD
 from dynamic_network_architectures.building_blocks.helper import maybe_convert_scalar_to_list, get_matching_pool_op
 from dynamic_network_architectures.building_blocks.simple_conv_blocks import StackedConvBlocks
+import torch._dynamo
+torch._dynamo.config.suppress_errors = True
 
 
 
@@ -132,27 +134,26 @@ class SelfAttentionTransformer(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
-    def _generate_sinusoidal_embeddings(self, max_seq_length, d_model):
-        position = torch.arange(0, max_seq_length, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(max_seq_length, d_model)
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # Add batch dimension
-        return pe
+    def _generate_sinusoidal_embeddings(self, seq_length, d_model):
+        position = torch.arange(seq_length).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
+        
+        pos_embedding = torch.zeros(seq_length, d_model)
+        pos_embedding[:, 0::2] = torch.sin(position * div_term)
+        pos_embedding[:, 1::2] = torch.cos(position * div_term)
+        return pos_embedding
 
     def forward(self, src, mask=None):
-        # flatten NxCxHxW to HWxNxC
         src_shape = src.shape
-        src = src.flatten(2).permute(2, 0, 1)
+        #src = src.permute(1, 0, 2)
 
-        pos_embed = self.position_embedding[:, :src.size(0), :]
+        pos_embed = self.position_embedding.repeat(src_shape[0], 1, 1)
 
         if mask is not None:
             mask = mask.flatten(1)
 
         memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-        return memory.permute(1, 2, 0).view(src_shape)
+        return memory
 
 
 class TransformerEncoder(nn.Module):
@@ -208,9 +209,12 @@ class TransformerEncoderLayer(nn.Module):
         self.normalize_before = normalize_before
 
     def with_pos_embed(self, tensor, pos: Optional[Tensor]):
-        return tensor if pos is None else tensor + pos
+        nb, seq_length, d_model = tensor.shape
+        pos = pos[:,:seq_length, :]
+        return tensor + pos
 
-    def forward_post(
+
+    def forward(
         self,
         src,
         src_mask: Optional[Tensor] = None,
@@ -221,7 +225,6 @@ class TransformerEncoderLayer(nn.Module):
         src2, attn_weights = self.self_attn(
             q, k, value=src, attn_mask=src_mask, key_padding_mask=src_key_padding_mask
         )
-        src2 = F.softmax(src2, dim=-1)
         src = src + self.dropout1(src2)
         src = self.norm1(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
@@ -229,35 +232,7 @@ class TransformerEncoderLayer(nn.Module):
         src = self.norm2(src)
         return src
 
-    def forward_pre(
-        self,
-        src,
-        src_mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        pos: Optional[Tensor] = None,
-    ):
-        src2 = self.norm1(src)
-        q = k = self.with_pos_embed(src2, pos)
-        src2, attn_weights = self.self_attn(
-            q, k, value=src2, attn_mask=src_mask, key_padding_mask=src_key_padding_mask
-        )
-        src2 = F.softmax(src2, dim=-1)
-        src = src + self.dropout1(src2)
-        src2 = self.norm2(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src2))))
-        src = src + self.dropout2(src2)
-        return src
 
-    def forward(
-        self,
-        src,
-        src_mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        pos: Optional[Tensor] = None,
-    ):
-        if self.normalize_before:
-            return self.forward_pre(src, src_mask, src_key_padding_mask, pos)
-        return self.forward_post(src, src_mask, src_key_padding_mask, pos)
 
 
 def _get_clones(module, N):
@@ -429,16 +404,18 @@ class ResidualEncoder(nn.Module):
 
 
         batch_size = x.size(0)
+        x_shape = x.shape
         x = x.view(batch_size, -1, self.output_channels[-1])  # Flatten spatial dimensions
+        
         x = self.linear_to_transformer(x)  # Apply linear layer to get desired transformer dimension
         
-        x, attn = self.transformer(x)
+        x = self.transformer(x)
         # Apply the reverse linear layer to convert back to the original conv output dimension
         x = self.linear_from_transformer(x)
 
         # Reshape back to original conv output shape
-        spatial_dims = int(np.cbrt(x.size(1)))
-        x = x.view(batch_size, self.output_channels[-1], spatial_dims, spatial_dims, spatial_dims)       
+        spatial_dims = x_shape[2:]
+        x = x.permute(0,2,1).view(batch_size, self.output_channels[-1], *spatial_dims)
         
         
         ret[-1] = x
@@ -462,42 +439,23 @@ class ResidualEncoder(nn.Module):
         return output
 
 #import hiddenlayer as hl
-
 if __name__ == '__main__':
     import torch
     from torch import nn, optim
     from torch.utils.data import DataLoader, TensorDataset
     import numpy as np
-    data = torch.rand((1, 3, 128, 160))
 
-    model = ResidualEncoder(3, 5, (2, 4, 6, 8, 10), nn.Conv2d, 3, ((1, 1), 2, (2, 2), (2, 2), (2, 2)), 2, False,
-                            nn.BatchNorm2d, None, None, None, nn.ReLU, None, stem_channels=7)
-    
-    '''
-    g = hl.build_graph(model, data,
-                       transforms=None)
-    g.save("network_architecture.pdf")
-    del g
-    '''
-
-    #print(model.compute_conv_feature_map_size((128, 160)))
- # Create a random 3D dataset (replace this with your actual dataset)
-# Create a random 3D dataset (replace this with your actual dataset)
+    # Create a random 3D dataset
     def create_random_3d_dataset(num_samples, input_shape, num_classes):
         X = torch.randn(num_samples, *input_shape)
-        #y = torch.randint(0,num_samples, (num_samples, 2,2,2)
-        y_classes = torch.randint(0, num_classes, (num_samples, num_classes, 1, 1, 1))
-        y_floats = torch.randn(num_samples, num_classes, 2,2,2) 
-        y = y_classes + y_floats
-        # Random class labels for the second dimension
-   
-        return TensorDataset(X, y)
+        y_classes = torch.randint(0, num_classes, (num_samples,))
+        return TensorDataset(X, y_classes)
 
     # Hyperparameters
-    input_shape = (3, 32, 32, 32)  # 3D data shape (e.g., channels, depth, height, width)
+    input_shape = (3, 40, 56, 40)  # 3D data shape (e.g., channels, depth, height, width)
     num_classes = 10
     num_samples = 100
-    batch_size = 4
+    batch_size = 8
     learning_rate = 0.001
     num_epochs = 10
 
@@ -509,7 +467,7 @@ if __name__ == '__main__':
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     # Initialize model
-    model = ResidualEncoder(3, 5, (2, 4, 6, 8, 10), nn.Conv3d, 3, ((1, 1, 1), 2, (2, 2, 2), (2, 2, 2), (2, 2, 2)), 2, False,
+    model = ResidualEncoder(3, 4, (32, 64, 128,256), nn.Conv3d, 3, ((1, 1, 1), (2, 2, 2), (2, 2, 2), (2, 2, 2)), 2, False,
                             nn.BatchNorm3d, None, None, None, nn.ReLU, None, stem_channels=7)
 
     # Loss and optimizer
@@ -520,13 +478,16 @@ if __name__ == '__main__':
     def train(model, train_loader, criterion, optimizer, num_epochs):
         model.train()
         for epoch in range(num_epochs):
+            running_loss = 0.0
             for inputs, targets in train_loader:
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 loss.backward()
                 optimizer.step()
-            print(f'Epoch {epoch+1}/{num_epochs}, Loss: {loss.item():.4f}')
+                running_loss += loss.item()
+            epoch_loss = running_loss / len(train_loader)
+            print(f'Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}')
 
     # Testing loop
     def test(model, test_loader, criterion):
@@ -545,6 +506,6 @@ if __name__ == '__main__':
         print(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)')
 
     # Train and test the model
-    #train(model, train_loader, criterion, optimizer, num_epochs)
-    #test(model, test_loader, criterion)
+    train(model, train_loader, criterion, optimizer, num_epochs)
+    test(model, test_loader, criterion)
     
