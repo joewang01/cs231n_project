@@ -101,153 +101,10 @@ import torch._dynamo
 torch._dynamo.config.suppress_errors = True
 
 
+import torch
+import torch.nn as nn
 
-class SelfAttentionTransformer(nn.Module):
-    def __init__(
-        self,
-        d_model=512,
-        nhead=8,
-        num_encoder_layers=6,
-        dim_feedforward=2048,
-        dropout=0.1,
-        activation="relu",
-        normalize_before=False,
-        max_seq_length=1000,
-    ):
-        super().__init__()
-
-        encoder_layer = TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout, activation, normalize_before
-        )
-        encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
-        self.encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
-
-        self.position_embedding = self._generate_sinusoidal_embeddings(max_seq_length, d_model)
-
-        self._reset_parameters()
-
-        self.d_model = d_model
-        self.nhead = nhead
-
-    def _reset_parameters(self):
-        for p in self.parameters():
-            if p.dim() > 1:
-                nn.init.xavier_uniform_(p)
-
-    def _generate_sinusoidal_embeddings(self, seq_length, d_model):
-        position = torch.arange(seq_length).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * -(math.log(10000.0) / d_model))
-        
-        pos_embedding = torch.zeros(seq_length, d_model)
-        pos_embedding[:, 0::2] = torch.sin(position * div_term)
-        pos_embedding[:, 1::2] = torch.cos(position * div_term)
-        return pos_embedding.unsqueeze(1)
-
-    def forward(self, src, mask=None):
-        src_shape = src.shape
-        #src = src.permute(1, 0, 2)
-
-        pos_embed = self.position_embedding.to(src.device)
-
-        if mask is not None:
-            mask = mask.flatten(1)
-
-        memory = self.encoder(src, src_key_padding_mask=mask, pos=pos_embed)
-        return memory
-
-
-class TransformerEncoder(nn.Module):
-    def __init__(self, encoder_layer, num_layers, norm=None):
-        super().__init__()
-        self.layers = _get_clones(encoder_layer, num_layers)
-        self.num_layers = num_layers
-        self.norm = norm
-
-    def forward(
-        self,
-        src,
-        mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        pos: Optional[Tensor] = None,
-    ):
-        output = src
-
-        for layer in self.layers:
-            output = layer(
-                output, src_mask=mask, src_key_padding_mask=src_key_padding_mask, pos=pos
-            )
-
-        if self.norm is not None:
-            output = self.norm(output)
-
-        return output
-
-
-class TransformerEncoderLayer(nn.Module):
-    def __init__(
-        self,
-        d_model,
-        nhead,
-        dim_feedforward=2048,
-        dropout=0.1,
-        activation="gelu",
-        normalize_before=False,
-    ):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-        self.activation = _get_activation_fn(activation)
-        self.normalize_before = normalize_before
-
-    def with_pos_embed(self, tensor, pos: Optional[Tensor]):
-        seq_length, _, _ = tensor.shape
-        pos = pos[:seq_length,:, :]
-        return tensor + pos
-
-
-    def forward(
-        self,
-        src,
-        src_mask: Optional[Tensor] = None,
-        src_key_padding_mask: Optional[Tensor] = None,
-        pos: Optional[Tensor] = None,
-    ):
-        x_pos = self.with_pos_embed(src, pos)
-        src2, attn_weights = self.self_attn(
-            x_pos, x_pos, value=x_pos, attn_mask=src_mask, key_padding_mask=src_key_padding_mask
-        )
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(src2)
-        src = self.norm2(src)
-        return src
-
-
-
-
-def _get_clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
-
-
-def _get_activation_fn(activation):
-    """Return an activation function given a string"""
-    if activation == "relu":
-        return F.relu
-    if activation == "gelu":
-        return F.gelu
-    if activation == "glu":
-        return F.glu
-    raise RuntimeError(f"activation should be relu/gelu, not {activation}.")
+from dynamic_network_architectures.building_blocks.Transformer import *
 
 
 
@@ -362,22 +219,6 @@ class ResidualEncoder(nn.Module):
         self.strides = [maybe_convert_scalar_to_list(conv_op, i) for i in strides]
         self.return_skips = return_skips
 
-        # self.patch_size = patch_size  # e.g. [48, 192, 192]
-        # config_vit = vit_configs.get_r50_l16_config()
-        #config_vit.transformer.num_layers = 12 # hardcoded
-        # config_vit.hidden_size =  768 # hardcoded
-        # config_vit.transformer.mlp_dim = 3072 #hardcoded
-        # config_vit.transformer.num_heads = 12 #hardcoded
-        # self.conv_more = nn.Conv3d(config_vit.hidden_size, self.output_channels[-1], 1)
-        # vit_layer_scale = True #hardcoded
-        # num_pool_per_axis = np.prod(np.array(pool_op_kernel_sizes), axis=0)
-        # num_pool_per_axis = np.log2(num_pool_per_axis).astype(np.uint8)
-        # feat_size = [int(self.patch_size[0]/2**num_pool_per_axis[0]), int(self.patch_size[1]/2**num_pool_per_axis[1]), int(self.patch_size[2]/2**num_pool_per_axis[2])]
-        # feat_size = [3,3,3] # hardcoded
-        # self.transformer = Transformer(config_vit, feat_size=feat_size, vis=False, feat_channels=self.output_channels[-1], use_layer_scale=vit_layer_scale)
-        # self.transformer.load_from(weights=np.load(config_vit.pretrained_path))
-        
-
         # we store some things that a potential decoder needs
         self.conv_op = conv_op
         self.norm_op = norm_op
@@ -389,36 +230,23 @@ class ResidualEncoder(nn.Module):
         self.conv_bias = conv_bias
         self.kernel_sizes = kernel_sizes
 
+        #self.transformerPass = TransformerPass(features_per_stage[-1],d_model=1024,pos_embedding_method="rotary")
+        #self.transformerPass = [TransformerPass(features_per_stage[i],d_model=1024,pos_embedding_method="rotary") for i in range(len(self.stages))]
+        self.transformerPass = nn.ModuleList([TransformerPass(features_per_stage[i], d_model=1024, pos_embedding_method="rotary") for i in range(len(self.stages))])
 
-        self.transformer = SelfAttentionTransformer(d_model=512)
-        self.linear_to_transformer = nn.Linear(features_per_stage[-1], 512)
-        self.linear_from_transformer = nn.Linear(512, features_per_stage[-1])
 
     def forward(self, x):
         if self.stem is not None:
             x = self.stem(x)
         ret = []
-        for s in self.stages:
+        for j,s in enumerate(self.stages):
             x = s(x)
+            x = self.transformerPass[j](x)
             ret.append(x)
 
-
-        batch_size = x.size(0)
-        x_shape = x.shape
-        x = x.view(batch_size,self.output_channels[-1],-1).permute(2,0,1)  # Flatten spatial dimensions
+        #x = self.transformerPass(x)
         
-        x = self.linear_to_transformer(x)  # Apply linear layer to get desired transformer dimension
-        
-        x = self.transformer(x)
-        # Apply the reverse linear layer to convert back to the original conv output dimension
-        x = self.linear_from_transformer(x)
-
-        # Reshape back to original conv output shape
-        spatial_dims = x_shape[2:]
-        x = x.permute(1,2,0).view(batch_size, self.output_channels[-1], *spatial_dims)
-        
-        
-        ret[-1] = x
+        #ret[-1] = x
 
         if self.return_skips:
             return ret
@@ -465,11 +293,16 @@ if __name__ == '__main__':
 
     test_dataset = create_random_3d_dataset(num_samples // 4, input_shape, num_classes)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
 
     # Initialize model
-    model = ResidualEncoder(3, 4, (32, 64, 128,256), nn.Conv3d, 3, ((1, 1, 1), (2, 2, 2), (2, 2, 2), (2, 2, 2)), 2, False,
+    model = ResidualEncoder(3, 4, (32,64,128,256), nn.Conv3d, 3, ((1, 1, 1), (2, 2, 2), (2, 2, 2), (2, 2, 2)), 2, False,
                             nn.BatchNorm3d, None, None, None, nn.ReLU, None, stem_channels=7)
 
+    model.to(device)
     # Loss and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
@@ -480,6 +313,7 @@ if __name__ == '__main__':
         for epoch in range(num_epochs):
             running_loss = 0.0
             for inputs, targets in train_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)

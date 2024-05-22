@@ -361,11 +361,14 @@ if __name__ == '__main__':
                                               3, 24, 3, 1, True, nn.BatchNorm2d, {}, None, None, nn.LeakyReLU,
                                               {'inplace': True}),
                           stx)
+    
+    
     import hiddenlayer as hl
 
     g = hl.build_graph(model, data,
                        transforms=None)
     g.save("network_architecture.pdf")
     del g
-
+    
+    
     print(stx.compute_conv_feature_map_size((40, 32)))

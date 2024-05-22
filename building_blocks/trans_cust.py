@@ -130,33 +130,28 @@ shared_cache_module = SharedCache(rope_cache_shared)
 
 
 class ChunkedLinear(nn.Module):
-    def __init__(self, chunk_size=2000, out_features=1000):
+    def __init__(self, seq_len,chunk_size=2000, out_features=1000):
         super(ChunkedLinear, self).__init__()
         self.linear_blocks = nn.ModuleList()
         self.block_size = chunk_size
         self.num_blocks = None 
         self.out_features = out_features
+        self.seq_len = seq_len
+        
+        self.num_blocks = (seq_len + self.block_size - 1) // self.block_size
+        self.linear_blocks = nn.ModuleList(
+            [nn.Linear(min(self.chunk_size, seq_len - i * self.chunk_size), self.out_features)
+             for i in range(self.num_blocks)])    
 
     def forward(self, x):
-        # Assuming x is of shape (batch_size, seq_len, in_features)
-        
-        batch_size, nh,in_features,seq_len = x.shape 
-        accumulated_output = None
-        
-        # Process each chunk with a for loop
-        if self.num_blocks is None:
-            # Initialize the number of blocks
-            self.num_blocks = (seq_len + self.block_size - 1) // self.block_size
-            for i in range(self.num_blocks):
-                self.linear_blocks.append(nn.LazyLinear(self.out_features).to(x.device))
-        
+     
         # Initialize the accumulated output
         accumulated_output = []
         
         # Handle the remaining elements
         for i in range(self.num_blocks):
             start_idx = i * self.block_size
-            end_idx = min(start_idx + self.block_size, seq_len)
+            end_idx = min(start_idx + self.block_size, self.seq_len)
             chunk = x[:,:,:, start_idx:end_idx]
             chunk_output = self.linear_blocks[i](chunk)
             accumulated_output.append(chunk_output)
@@ -187,7 +182,7 @@ class CausalSelfAttention(nn.Module):
         activation="gelu",
         normalize_before=False,
         max_seq_length=3000,
-        use_rotary=False
+        use_rotary=False,
         ):    
         super().__init__()     
         k = 1000
@@ -199,6 +194,7 @@ class CausalSelfAttention(nn.Module):
         
         self.rope_cache = shared_cache_module.rope_cache if use_rotary and shared_cache_module else None
         
+        self.initialized = False
         '''
         if use_rotary:
             assert (d_model % nhead) % 2 == 0
@@ -219,6 +215,11 @@ class CausalSelfAttention(nn.Module):
         
         if self.rope:
             rope_cache = precompute_rotary_emb( d_model//nhead, max_seq_length)
+        
+        def initialize_layers(self, input_size):
+            self.proj_k = ChunkedLinear(input_size=input_size,chunk_size=block_size, out_features=1000)
+            self.proj_v = ChunkedLinear(input_size=input_size,chunk_size=block_size, out_features=1000) 
+            self.initialized = True
 
     def forward(self, x):
         B, T, C = x.size()
